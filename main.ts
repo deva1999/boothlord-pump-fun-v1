@@ -17,10 +17,13 @@
 //   2. SIZE small and recycle fast. Target 0.30 SOL per coin, built in
 //      tranches of at most 0.10 SOL per batch (and never more than the
 //      harness cap of 1% of the coin's real SOL reserves, so the order is
-//      never rejected for size). At most 5 open positions at once, so at
-//      most 1.5 SOL is ever deployed; the rest of the 10 SOL stays free to
-//      catch the next young coin. One shot per mint: once a coin is exited
-//      it is never re-entered, which keeps fee churn down.
+//      never rejected for size). A later tranche is added ONLY while the
+//      live price is still within 2% of the first buy's price — the build
+//      never chases a rising curve, which would drag the blended cost up
+//      toward the stop. At most 5 open positions at once, so at most
+//      1.5 SOL is ever deployed; the rest of the 10 SOL stays free to
+//      catch the next young coin. Once a coin is exited it is never
+//      re-entered, which keeps fee churn down.
 //   3. EXIT on rules, not hope — and let the tail run. The dev tape's
 //      shape decides the exits: after the entry trigger, the median coin
 //      bleeds about -30% while a thin tail explodes (about 16% of
@@ -80,6 +83,7 @@ const ENTRY_MIN_TRADES = 8; // enough tape to tell pressure from noise
 const ENTRY_MIN_RISE_BPS = 800; // +8% over the first-seen price
 const ENTRY_MIN_BUY_SHARE_BPS = 6_000; // buys >= 60% of observed volume
 const ENTRY_MAX_SLIPPAGE_BPS = 500;
+const ADD_MAX_ABOVE_FIRST_BUY_BPS = 10_200; // top-ups only within +2% of the first buy's price
 
 const TAKE_PROFIT_BPS = 30_000; // +200% over blended cost basis: bank the tail
 const STOP_LOSS_BPS = 9_400; // -6% under blended cost basis: cut the bleed early
@@ -133,6 +137,9 @@ interface CoinTape {
   sellVolume: bigint; // lamports of sell-side sol_amount seen
   enteredSlot: number | null; // slot of the first buy decision, if entered
   exited: boolean; // fully exited: never re-enter
+  firstBuyQ: bigint; // virtual quote reserves at the first buy decision
+  firstBuyT: bigint; // virtual token reserves at the first buy decision
+  firstBuySet: boolean;
 }
 
 // ------------------------------------------------------------------ the bot
@@ -179,6 +186,9 @@ function observeBatch(state: BotState, batch: Batch): void {
         sellVolume: 0n,
         enteredSlot: null,
         exited: false,
+        firstBuyQ: 0n,
+        firstBuyT: 1n,
+        firstBuySet: false,
       });
       continue;
     }
@@ -195,6 +205,9 @@ function observeBatch(state: BotState, batch: Batch): void {
           sellVolume: 0n,
           enteredSlot: null,
           exited: false,
+          firstBuyQ: 0n,
+          firstBuyT: 1n,
+          firstBuySet: false,
         };
         tapes.set(event.mint, tape);
       }
@@ -229,6 +242,10 @@ function decideExits(state: BotState, orders: OrderInput[]): void {
     if (curve === undefined || curve.complete) continue;
     const tape = tapes.get(mint);
     if (tape === undefined || tape.enteredSlot === null) continue;
+    // A sell already sent for this mint must not be sent again while its
+    // fill is still in flight: the position row still lists the tokens
+    // until the fill lands, and a second sell would be rejected.
+    if (tape.exited) continue;
     const [curQ, curT] = curvePrice(curve);
     if (curT <= 0n || curQ <= 0n) continue;
     const cost = holding.cost_lamports;
@@ -263,35 +280,48 @@ function decideExits(state: BotState, orders: OrderInput[]): void {
 
 function decideEntries(state: BotState, orders: OrderInput[]): void {
   if (buysHalted) return;
-  if (state.committedPositionCount() >= MAX_OPEN_POSITIONS) return;
 
   for (const [mint, tape] of tapes) {
     if (orders.length >= MAX_ORDERS_PER_BATCH) break;
-    if (state.committedPositionCount() >= MAX_OPEN_POSITIONS) break;
-    if (tape.exited || tape.enteredSlot !== null) continue;
-    if (state.positions.has(mint)) continue;
+    if (tape.exited) continue;
 
     const curve = state.curves.get(mint);
     if (curve === undefined || curve.complete) continue;
-    const age = state.slot - tape.firstSlot;
-    if (age < 0 || age > ENTRY_MAX_AGE_SLOTS) continue;
-    if (tape.trades < ENTRY_MIN_TRADES) continue;
-
     const [curQ, curT] = curvePrice(curve);
     if (curT <= 0n || curQ <= 0n) continue;
-    // Momentum: price up at least 8% from the first-seen price.
-    if (!priceUpAtLeast(curQ, curT, tape.firstQ, tape.firstT, ENTRY_MIN_RISE_BPS)) continue;
-    // Real buying pressure: buys at least 60% of observed volume.
-    const volume = tape.buyVolume + tape.sellVolume;
-    if (volume <= 0n) continue;
-    if (tape.buyVolume * 10_000n < volume * BigInt(ENTRY_MIN_BUY_SHARE_BPS)) continue;
+    const age = state.slot - tape.firstSlot;
+    if (age < 0 || age > ENTRY_MAX_AGE_SLOTS) continue;
+
+    if (tape.enteredSlot === null) {
+      // FIRST BUY: the full entry trigger. A new position also needs a
+      // free position slot; a top-up on an open position does not.
+      if (state.committedPositionCount() >= MAX_OPEN_POSITIONS) break;
+      if (tape.trades < ENTRY_MIN_TRADES) continue;
+      // Momentum: price up at least 8% from the first-seen price.
+      if (!priceUpAtLeast(curQ, curT, tape.firstQ, tape.firstT, ENTRY_MIN_RISE_BPS)) continue;
+      // Real buying pressure: buys at least 60% of observed volume.
+      const volume = tape.buyVolume + tape.sellVolume;
+      if (volume <= 0n) continue;
+      if (tape.buyVolume * 10_000n < volume * BigInt(ENTRY_MIN_BUY_SHARE_BPS)) continue;
+    } else {
+      // TOP-UP: the thesis is already open. Add only while the live price
+      // is still within 2% of the first buy's price — never chase a
+      // rising curve, which would drag the blended cost up toward the
+      // stop. No momentum re-check: the position is already open.
+      if (!tape.firstBuySet) continue;
+      if (!priceDownToAtMost(curQ, curT, tape.firstBuyQ, tape.firstBuyT, ADD_MAX_ABOVE_FIRST_BUY_BPS)) continue;
+    }
+
     // The harness caps one batch's buys on a mint at 1% of real reserves;
     // below 1 SOL of real reserves a 0.01 SOL buy cannot fit the cap.
     if (curve.real_quote_reserves < MIN_REAL_RESERVES_LAMPORTS) continue;
 
     // Size this tranche: at most 0.10 SOL, at most the harness cap, and
-    // only up to what is left of the 0.30 SOL target (pending buys count).
-    const committed = pendingBuyLamports(state, mint);
+    // only up to what is left of the 0.30 SOL target (the position's cost
+    // plus pending buys count toward it).
+    const held = state.positions.get(mint);
+    const committed =
+      (held === undefined ? 0n : held.cost_lamports) + pendingBuyLamports(state, mint);
     const remaining = TARGET_POSITION_LAMPORTS - committed;
     if (remaining < MIN_BUY_LAMPORTS) continue;
     let tranche = remaining < MAX_TRANCHE_LAMPORTS ? remaining : MAX_TRANCHE_LAMPORTS;
@@ -309,7 +339,12 @@ function decideEntries(state: BotState, orders: OrderInput[]): void {
       quote_lamports: tranche,
       max_slippage_bps: ENTRY_MAX_SLIPPAGE_BPS,
     });
-    tape.enteredSlot = state.slot;
+    if (tape.enteredSlot === null) {
+      tape.enteredSlot = state.slot;
+      tape.firstBuyQ = curQ;
+      tape.firstBuyT = curT;
+      tape.firstBuySet = true;
+    }
   }
 }
 
