@@ -36,7 +36,10 @@
 //      only while a position is underwater, so dead capital is freed for
 //      fresh coins while a live winner is never cut short by the clock.
 //      The final window is only 6 hours long; holding a flat coin to the
-//      flatten is the same as losing slowly.
+//      flatten is the same as losing slowly. One sell in flight at most
+//      per mint, and a sell that is rejected or fails is retried while
+//      none is pending — a stranded position would clog one of the 5
+//      slots for the rest of the run; only a filled sell closes a coin.
 //   4. GUARD the downside. Equity (cash plus positions marked at the live
 //      bonding-curve price) is tracked against its peak; once drawdown
 //      passes 40% no new buys are opened until equity recovers, which keeps
@@ -154,6 +157,15 @@ function equityLamports(state: BotState): bigint {
 }
 
 function observeBatch(state: BotState, batch: Batch): void {
+  // A filled sell confirms the exit: the coin is done and never
+  // re-entered. A rejected or failed sell confirms nothing — the exit
+  // stays open and decideExits may retry it once no sell is pending.
+  for (const fill of batch.fills) {
+    if (fill.side === "sell" && fill.status === "filled") {
+      const tape = tapes.get(fill.mint);
+      if (tape !== undefined) tape.exited = true;
+    }
+  }
   for (const event of batch.events) {
     if (event.event === "CreateEvent") {
       const existing = tapes.get(event.mint);
@@ -212,16 +224,28 @@ function pendingBuyLamports(state: BotState, mint: string): bigint {
   return total;
 }
 
+// A sell already in flight for this mint: sending another now would only
+// be rejected (the position row still lists the tokens until the fill
+// lands). Once the in-flight sell resolves, a rejected or failed one
+// leaves no sell pending, so the exit can be retried next batch.
+function hasPendingSell(state: BotState, mint: string): boolean {
+  for (const pending of state.pending.values()) {
+    if (pending.order.side === "sell" && pending.order.mint === mint) return true;
+  }
+  return false;
+}
+
 function decideExits(state: BotState, orders: OrderInput[]): void {
   for (const [mint, holding] of state.positions) {
     const curve = state.curves.get(mint);
     if (curve === undefined || curve.complete) continue;
     const tape = tapes.get(mint);
     if (tape === undefined || tape.enteredSlot === null) continue;
-    // A sell already sent for this mint must not be sent again while its
-    // fill is still in flight: the position row still lists the tokens
-    // until the fill lands, and a second sell would be rejected.
-    if (tape.exited) continue;
+    // One sell in flight at most: while a sell for this mint is pending
+    // its fill, sending another only earns a rejection. A rejected or
+    // failed sell clears the pending slot, so the exit is retried — the
+    // exit is only final when a fill confirms it (see observeBatch).
+    if (hasPendingSell(state, mint)) continue;
     const [curQ, curT] = curvePrice(curve);
     if (curT <= 0n || curQ <= 0n) continue;
     const cost = holding.cost_lamports;
@@ -249,7 +273,10 @@ function decideExits(state: BotState, orders: OrderInput[]): void {
         token_amount: tokens,
         max_slippage_bps: EXIT_MAX_SLIPPAGE_BPS,
       });
-      tape.exited = true;
+      // Note: tape.exited is NOT set here. The exit becomes final only
+      // when the sell's fill arrives (observeBatch); until then a
+      // rejected or failed sell must stay retryable, or the position
+      // strands and clogs its slot for the rest of the run.
     }
   }
 }
