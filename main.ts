@@ -21,12 +21,19 @@
 //      most 1.5 SOL is ever deployed; the rest of the 10 SOL stays free to
 //      catch the next young coin. One shot per mint: once a coin is exited
 //      it is never re-entered, which keeps fee churn down.
-//   3. EXIT on rules, not hope. Take profit at +50% over the blended cost
-//      basis, stop loss at -20%, a trailing exit that sells when a coin
-//      that peaked at +30% or better gives back 12% from its peak, and a
-//      hard age exit after ~12,000 slots (~45 minutes) so dead capital is
-//      freed for fresh coins. The final window is only 6 hours long;
-//      holding a flat coin to the flatten is the same as losing slowly.
+//   3. EXIT on rules, not hope — and let the tail run. The dev tape's
+//      shape decides the exits: after the entry trigger, the median coin
+//      bleeds about -30% while a thin tail explodes (about 16% of
+//      triggered coins reach +100%, 9% reach +200%, and those that do get
+//      there fast — a median of ~200 slots). So the stop is TIGHT and the
+//      target is WIDE: stop loss at -6% under the blended cost basis,
+//      take profit at +200% over it, no trailing exit and no partial
+//      sales (both were measured to cap the tail that pays for the
+//      losers). A hard age exit after ~12,000 slots (~45 minutes) applies
+//      only while a position is underwater, so dead capital is freed for
+//      fresh coins while a live winner is never cut short by the clock.
+//      The final window is only 6 hours long; holding a flat coin to the
+//      flatten is the same as losing slowly.
 //   4. GUARD the downside. Equity (cash plus positions marked at the live
 //      bonding-curve price) is tracked against its peak; once drawdown
 //      passes 40% no new buys are opened until equity recovers, which keeps
@@ -46,8 +53,11 @@
 // FEES (why the thresholds sit where they do): a round trip pays about
 // 1.25% of value in curve fees each way plus ~0.000105 SOL of transaction
 // fees per order, so a trade needs roughly a 3% move just to break even.
-// The +50% / -20% exits are set far outside that band on purpose: the
-// strategy only pays the fee toll when the curve has genuinely moved.
+// The -6% stop sits just outside that band on purpose — tight enough to
+// cut the median -30% bleed early, wide enough not to be pure fee noise —
+// and the +200% target sits far outside it, so the strategy only pays
+// the fee toll when the curve has genuinely moved, and only banks the
+// moves that actually pay.
 
 import { runBot, LAMPORTS_PER_SOL } from "./vendor/makefun-bot.ts";
 import type { Batch, BotState, OrderInput } from "./vendor/makefun-bot.ts";
@@ -71,11 +81,9 @@ const ENTRY_MIN_RISE_BPS = 800; // +8% over the first-seen price
 const ENTRY_MIN_BUY_SHARE_BPS = 6_000; // buys >= 60% of observed volume
 const ENTRY_MAX_SLIPPAGE_BPS = 500;
 
-const TAKE_PROFIT_BPS = 15_000; // +50% over blended cost basis
-const STOP_LOSS_BPS = 8_000; // -20% under blended cost basis
-const TRAIL_ARM_BPS = 13_000; // trailing exit arms once the peak hits +30%
-const TRAIL_GIVEBACK_BPS = 8_800; // sell when price falls to 88% of its peak
-const EXIT_MAX_AGE_SLOTS = 12_000; // ~45 min: hard age exit, frees the slot
+const TAKE_PROFIT_BPS = 30_000; // +200% over blended cost basis: bank the tail
+const STOP_LOSS_BPS = 9_400; // -6% under blended cost basis: cut the bleed early
+const EXIT_MAX_AGE_SLOTS = 12_000; // ~45 min: age exit, underwater positions only
 const EXIT_MAX_SLIPPAGE_BPS = 500;
 
 const DRAWDOWN_HALT_BPS = 4_000; // halt new buys past 40% drawdown from peak equity
@@ -125,9 +133,6 @@ interface CoinTape {
   sellVolume: bigint; // lamports of sell-side sol_amount seen
   enteredSlot: number | null; // slot of the first buy decision, if entered
   exited: boolean; // fully exited: never re-enter
-  peakQ: bigint; // virtual quote reserves at the best price since entry
-  peakT: bigint; // virtual token reserves at the best price since entry
-  peakSet: boolean;
 }
 
 // ------------------------------------------------------------------ the bot
@@ -174,9 +179,6 @@ function observeBatch(state: BotState, batch: Batch): void {
         sellVolume: 0n,
         enteredSlot: null,
         exited: false,
-        peakQ: 0n,
-        peakT: 1n,
-        peakSet: false,
       });
       continue;
     }
@@ -193,9 +195,6 @@ function observeBatch(state: BotState, batch: Batch): void {
           sellVolume: 0n,
           enteredSlot: null,
           exited: false,
-          peakQ: 0n,
-          peakT: 1n,
-          peakSet: false,
         };
         tapes.set(event.mint, tape);
       }
@@ -236,31 +235,21 @@ function decideExits(state: BotState, orders: OrderInput[]): void {
     const tokens = holding.token_amount;
     if (cost <= 0n || tokens <= 0n) continue;
 
-    // Track the best price since entry for the trailing exit. The cost
-    // basis (cost per token, fees included) is the reference: comparing
-    // the live curve price against it is conservative by the entry fees.
-    if (!tape.peakSet) {
-      tape.peakQ = curQ;
-      tape.peakT = curT;
-      tape.peakSet = true;
-    } else if (curQ * tape.peakT > tape.peakQ * curT) {
-      tape.peakQ = curQ;
-      tape.peakT = curT;
-    }
-
+    // The cost basis (cost per token, fees included) is the reference:
+    // comparing the live curve price against it is conservative by the
+    // entry fees, which is the safe side for both exits.
     const age = state.slot - tape.enteredSlot;
-    // Take profit: live price at least +50% over the cost basis.
+    // Take profit: live price at least +200% over the cost basis.
     const hitProfit = curQ * tokens * 10_000n >= cost * curT * BigInt(TAKE_PROFIT_BPS);
-    // Stop loss: live price at most 80% of the cost basis.
+    // Stop loss: live price at most 94% of the cost basis (-6%).
     const hitStop = curQ * tokens * 10_000n <= cost * curT * BigInt(STOP_LOSS_BPS);
-    // Trailing: peak reached +30% over cost, price now back to 88% of peak.
-    const peakArmed =
-      tape.peakQ * tokens * 10_000n >= cost * tape.peakT * BigInt(TRAIL_ARM_BPS);
-    const hitTrail =
-      peakArmed && curQ * tape.peakT * 10_000n <= tape.peakQ * curT * BigInt(TRAIL_GIVEBACK_BPS);
-    const hitAge = age >= EXIT_MAX_AGE_SLOTS;
+    // Age exit, underwater only: a position still below its cost basis
+    // after ~45 minutes is dead capital — free the slot. A position
+    // above cost keeps riding; the stop below protects it.
+    const underwater = curQ * tokens < cost * curT;
+    const hitAge = age >= EXIT_MAX_AGE_SLOTS && underwater;
 
-    if (hitProfit || hitStop || hitTrail || hitAge) {
+    if (hitProfit || hitStop || hitAge) {
       orders.push({
         side: "sell",
         mint,
